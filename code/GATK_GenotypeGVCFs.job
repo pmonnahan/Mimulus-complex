@@ -1,0 +1,44 @@
+#!/bin/bash
+#PBS -l mem=62gb,nodes=1:ppn=24,walltime=96:00:00
+#PBS -m abe
+#PBS -A brandvai
+#PBS -M pmonnaha@umn.edu
+#PBS -o /home/brandvai/pmonnaha/OandE/GATK_GenotypeGVCFs.o
+#PBS -e /home/brandvai/pmonnaha/OandE/GATK_GenotypeGVCFs.e
+#PBS -q mesabi
+
+module load java
+module load gatk/3.7.0
+
+#	Path to the reference
+REF="/home/brandvai/pmonnaha/mimulus_data/Mguttatus_256_v2.0.hardmasked.fa"
+REF_DICT="/home/brandvai/pmonnaha/mimulus_data/Mguttatus_256_v2.0.hardmasked.dict"
+#	Path to directory containing GVCFs
+GVCF_DIR="/panfs/roc/scratch/pmonnaha/Mimulus/gVCFs/"
+#	 Build the sample list
+SAMPLE_LIST=($(find ${GVCF_DIR} -name '*.g.vcf'))
+#	Put them into a format that will be accepted by the GATK command line
+GATK_IN=()
+for s in "${SAMPLE_LIST[@]}"
+do
+		GATK_IN+=("-V $s")
+	done
+#   Array of sequence names, since we are going to call SNPs in a task array
+SEQNAMES=($(cut -f 2 ${REF_DICT} | grep -E '^SN' | cut -f 2 -d ':'))
+#   Get which sequence we are analyzing with the task ID
+CURRENT=${SEQNAMES[${PBS_ARRAYID}]}
+#	Make sure the output directory exists
+OUTPUT_DIR="/panfs/roc/scratch/pmonnaha/Mimulus/"
+mkdir -p ${OUTPUT_DIR}
+
+export _JAVA_OPTIONS="-Xmx60g"
+java -jar /panfs/roc/msisoft/gatk/3.7.0/GenomeAnalysisTK.jar\
+	-nct 24 \
+	-T GenotypeGVCFs \
+	-R ${REF} \
+    -L ${CURRENT} \
+	${GATK_IN[@]}\
+	--heterozygosity 0.05\
+	--heterozygosity_stdev 0.03\
+	--sample_ploidy 2\
+	-o ${OUTPUT_DIR}/B73_${CURRENT}_GATK.vcf 
