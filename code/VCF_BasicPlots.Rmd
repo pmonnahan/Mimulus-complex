@@ -1,0 +1,284 @@
+---
+title: "M. guttatus complex basic visualizations"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = TRUE)
+library(vcfR)
+library(adegenet)
+library(adegraphics)
+library(pegas)
+library(StAMPP)
+library(lattice)
+library(gplots)
+library(ape)
+library(ggplot2)
+library(cowplot)
+
+glPcaFast <- function(x,
+ center=TRUE,
+ scale=FALSE,
+ nf=NULL,
+ loadings=TRUE,
+ alleleAsUnit=FALSE,
+ returnDotProd=FALSE){
+
+ if(!inherits(x, "genlight")) stop("x is not a genlight object")
+ # keep the original mean / var code, as it's used further down
+ # and has some NA checks..
+ if(center) {
+ vecMeans <- glMean(x, alleleAsUnit=alleleAsUnit)
+ if(any(is.na(vecMeans))) stop("NAs detected in the vector of means")
+ }
+ if(scale){
+ vecVar <- glVar(x, alleleAsUnit=alleleAsUnit)
+ if(any(is.na(vecVar))) stop("NAs detected in the vector of variances")
+ }
+ # convert to full data, try to keep the NA handling as similar
+ # to the original as possible
+ # - dividing by ploidy keeps the NAs
+ mx <- t(sapply(x$gen, as.integer)) / ploidy(x)
+ # handle NAs
+ NAidx <- which(is.na(mx), arr.ind = T)
+ if (center) {
+ mx[NAidx] <- vecMeans[NAidx[,2]]
+ } else {
+ mx[NAidx] <- 0
+ }
+ # center and scale
+ mx <- scale(mx,
+ center = if (center) vecMeans else F,
+ scale = if (scale) vecVar else F)
+ # all dot products at once using underlying BLAS
+ # to support thousands of samples, this could be
+ # replaced by 'Truncated SVD', but it would require more changes
+ # in the code around
+ allProd <- tcrossprod(mx) / nInd(x) # assume uniform weights
+ ## PERFORM THE ANALYSIS ##
+ ## eigenanalysis
+ eigRes <- eigen(allProd, symmetric=TRUE, only.values=FALSE)
+ rank <- sum(eigRes$values > 1e-12)
+ eigRes$values <- eigRes$values[1:rank]
+ eigRes$vectors <- eigRes$vectors[, 1:rank, drop=FALSE]
+ ## scan nb of axes retained
+ if(is.null(nf)){
+ barplot(eigRes$values, main="Eigenvalues", col=heat.colors(rank))
+ cat("Select the number of axes: ")
+ nf <- as.integer(readLines(n = 1))
+ }
+ ## rescale PCs 
+ res <- list()
+ res$eig <- eigRes$values
+ nf <- min(nf, sum(res$eig>1e-10))
+ ##res$matprod <- allProd # for debugging
+ ## use: li = XQU = V\Lambda^(1/2)
+ eigRes$vectors <- eigRes$vectors * sqrt(nInd(x)) # D-normalize vectors
+ res$scores <- sweep(eigRes$vectors[, 1:nf, drop=FALSE],2,
+sqrt(eigRes$values[1:nf]), FUN="*")
+ ## GET LOADINGS ##
+ ## need to decompose X^TDV into a sum of n matrices of dim p*r
+ ## but only two such matrices are represented at a time
+ if(loadings){
+ if(scale) {
+ vecSd <- sqrt(vecVar)
+ }
+ res$loadings <- matrix(0, nrow=nLoc(x), ncol=nf) # create empty matrix
+ ## use: c1 = X^TDV
+ ## and X^TV = A_1 + ... + A_n
+ ## with A_k = X_[k-]^T v[k-]
+ myPloidy <- ploidy(x)
+ for(k in 1:nInd(x)){
+ temp <- as.integer(x@gen[[k]]) / myPloidy[k]
+ if(center) {
+ temp[is.na(temp)] <- vecMeans[is.na(temp)]
+ temp <- temp - vecMeans
+ } else {
+ temp[is.na(temp)] <- 0
+ }
+ if(scale){
+ temp <- temp/vecSd
+ }
+ res$loadings <- res$loadings + matrix(temp) %*% eigRes$vectors[k,
+1:nf, drop=FALSE]
+ }
+ res$loadings <- res$loadings / nInd(x) # don't forget the /n of X_tDV
+ res$loadings <- sweep(res$loadings, 2, sqrt(eigRes$values[1:nf]),
+FUN="/")
+ }
+ ## FORMAT OUTPUT ##
+ colnames(res$scores) <- paste("PC", 1:nf, sep="")
+ if(!is.null(indNames(x))){
+ rownames(res$scores) <- indNames(x)
+ } else {
+ rownames(res$scores) <- 1:nInd(x)
+ }
+ if(!is.null(res$loadings)){
+ colnames(res$loadings) <- paste("Axis", 1:nf, sep="")
+ if(!is.null(locNames(x)) & !is.null(alleles(x))){
+ rownames(res$loadings) <- paste(locNames(x),alleles(x), sep=".")
+ } else {
+ rownames(res$loadings) <- 1:nLoc(x)
+ }
+ }
+ if(returnDotProd){
+ res$dotProd <- allProd
+ rownames(res$dotProd) <- colnames(res$dotProd) <- indNames(x)
+ }
+ res$call <- match.call()
+ class(res) <- "glPca"
+ return(res)
+}
+
+# Return a vector containing color values that vary depending on whether samples satisfy a criteria determined by the stats file
+filtColors = function(query, filter_df, filter_column, filter_value){
+  cc=c()
+  for (i in 1:length(query)){
+    if (query[i] %in% as.vector(filter_df[which(filter_df[,filter_column] < filter_value),]$Sample)){
+      cc=c(cc,"red")}
+      else {
+        cc=c(cc,"black")} }
+  return(cc)
+}
+
+# Filter a list of query sample names by criteria in the stats file
+filter = function(query, filter_df, filter_column, filter_value){
+  cc=c()
+  for (i in 1:length(query)){
+    if (query[i] %in% as.vector(filter_df[which(filter_df[,filter_column] > filter_value),]$Sample)){
+      cc=c(cc,query[i])}
+  }
+  return(cc)
+}
+
+# Return a vector containing color values that denote species
+tipColors = function(query, filter_df){
+  cc=c()
+  for (i in 1:length(query)){
+    if (query[i] %in% as.vector(filter_df$Sample)){
+      cc=c(cc,as.character(filter_df[filter_df$Sample == query[i], 'SpecCol']))}
+  }
+  return(cc)
+}
+
+```
+
+
+## Input Data
+
+```{r, include=TRUE, results='hide', message=FALSE, warning=FALSE}
+stats=read.csv("~/Documents/Research/Mimulus-complex/Sample_Stats_R.csv")
+chr11=read.vcfR("~/Documents/Research/Mimulus-complex/vcfs/Mim_sNNffold_11_FULL_BP.BI.DP_GATK.vcf.gz")
+chrom11=vcfR2genlight(chr11,n.cores=1)
+locNames(chrom11) <- paste(chr11@fix[,1],chr11@fix[,2],sep="_")
+pop(chrom11)<-substr(indNames(chrom11),1,3)
+```
+
+**Color key for later plots **
+```{r}
+#Make legend
+cols=c("deeppink4","gray48","darkorange3","darkturquoise","pink4","hotpink","gray39","gray64","gold","darkolivegreen3","darkolivegreen4","green","saddlebrown","lightpink","lightblue","lightyellow3","navajowhite1","mediumpurple2","firebrick1","dodgerblue","black","yellow4","skyblue4","yellow3","wheat3","turquoise4","yellow","tan1","thistle")
+names=c("bicolor","bolanderi","cupriphilis","decorus","dentilobus","douglasii","eastwoodiae","glabratus","glaucescens","guttatus.ann","guttatus.per","guttatus.unk","jungermannoides","kellogii","laciniatus","lutues","micranthus","mooschatus","nasutus","nudatus","pardalis","parishii","peregrinus","platycalyx","primuloides","robertsii","tilingii","unknown","verbenaceous")
+aa=ggplot(stats,aes(x=species,y=genome.mean,fill=species))+geom_bar(stat="identity")+scale_fill_manual(values=cols,labels=names)
+leg=get_legend(aa)
+plot_grid(leg)
+```
+
+### Use glPcaFast to calculate principal components on entire dataset (no filtering).  
+**Red points are samples with < 4x average coverage genome-wide**
+
+```{r, echo=TRUE}
+sampCols=filtColors(indNames(chrom11),stats,4,4) # Label < 4x genome-wide coverage samples with black dot.
+pca.1 <- glPcaFast(chrom11, nf=300) 
+col <- funky(5)
+g2 <- s.label (pca.1$scores, xax=1, yax=2, ppoints.col = sampCols, plabels =
+                    list(box = list(draw = FALSE),
+                         optim = TRUE), paxes.draw=T, pgrid.draw =F, plabels.cex=0.7, plot = TRUE)
+```
+
+
+## Subset data to higher coverage individuals (>4x genome-wide)
+
+```{r, eval=TRUE, echo=TRUE}
+
+MinAvgCov=4 # Minimum average genome-wide coverage
+PropMissing=0.75 # Maximum proportion of missing data for site to be included
+
+inc=filter(indNames(chrom11),stats,4,MinAvgCov) # column 4 is genome.mean from stats file
+chrom11.4x=new("genlight", (as.matrix(chrom11)[inc,])) # Subset by MinAvgCov
+chrom11.4x=new("genlight", (as.matrix(chrom11.4x))
+[,(colSums(is.na (as.matrix(chrom11.4x))) < nrow(chrom11.4x)*PropMissing)]) # subset by PropMissing
+pop(chrom11.4x)<-substr(indNames(chrom11.4x),1,3)
+pca.2 <- glPcaFast(chrom11.4x, nf=300) 
+colores=tipColors(indNames(chrom11.4x),stats) # get colors for tips
+g2 <- s.label (pca.2$scores, xax=1, yax=2, ppoints.col = colores, plabels =
+                    list(box = list(draw = FALSE),
+                         optim = TRUE), paxes.draw=T, pgrid.draw =F, plabels.cex=0.7, plot = TRUE)
+```
+
+### Calculate Nei's distances and heatmap
+
+```{r echo=TRUE}
+chrom11.4x.D <- stamppNeisD(chrom11.4x, pop = FALSE) # Nei's 1972 distance between indivs 
+colnames(chrom11.4x.D) <- rownames(chrom11.4x.D) 
+colores=tipColors(indNames(chrom11.4x),stats) # get colors for tips
+heatmap.2(chrom11.4x.D, trace="none", cexRow=0.4, cexCol=0.4,colRow=colores)
+```
+
+### Make NJ tree
+```{r}
+plot(nj(chrom11.4x.D),cex=0.5, type="fan",tip.color=colores) 
+```
+
+## Refilter to all individuals >= 4x in gene space (less-restrictive)
+
+```{r echo=TRUE}
+#samples with >4x coverage in gene-space
+
+MinAvgCov=4
+PropMissing=0.75
+
+inc2=filter(indNames(chrom11),stats,3,MinAvgCov)
+chrom11.4x.G=new("genlight", (as.matrix(chrom11)[inc2,])) # subset data
+chrom11.4x.G=new("genlight", (as.matrix(chrom11.4x.G))
+[,(colSums(is.na (as.matrix(chrom11.4x.G))) < nrow(chrom11.4x.G)*PropMissing)]) # retain only positions with no-missing data in > 25% individuals 
+
+sampCols=filtColors(indNames(chrom11.4x.G),stats,4,4)
+
+pop(chrom11.4x.G)<-substr(indNames(chrom11.4x.G),1,3)
+pca.3 <- glPcaFast(chrom11.4x.G, nf=300) 
+g2 <- s.label (pca.3$scores, xax=1, yax=2, ppoints.col = sampCols, plabels =
+                    list(box = list(draw = FALSE),
+                         optim = TRUE), paxes.draw=T, pgrid.draw =F, plabels.cex=0.7, plot = TRUE)
+```
+
+### Calculate Nei's distances and make NJ tree
+**Red labels indicate samples filtered out from more restrictive 4x genome-wide criteria**
+
+```{r echo=TRUE}
+chrom11.4x.G.D <- stamppNeisD(chrom11.4x.G, pop = FALSE) # Nei's 1972 distancebetween indivs 
+colnames(chrom11.4x.G.D) <- rownames(chrom11.4x.G.D) 
+heatmap.2(chrom11.4x.G.D, trace="none", cexRow=0.4, cexCol=0.4,colRow=sampCols)
+plot(nj(chrom11.4x.G.D),cex=0.5,type="fan",tip.color=sampCols) 
+```
+
+**Recolor labels by species ID**
+```{r echo=TRUE}
+colores=tipColors(indNames(chrom11.4x.G),stats) # get colors for tips
+heatmap.2(chrom11.4x.G.D, trace="none", cexRow=0.4, cexCol=0.4, colRow=colores)
+plot(nj(chrom11.4x.G.D),cex=0.5,type="fan",tip.color=colores) 
+```
+
+### Calculate PCA's without the JC and nasutus samples
+```{r}
+ninc=c("JC-S1","JC-S2","JC-S3","JC-S4","JC-S5","JC-S6","JC-S7","JC-S8","JC-S9","JC-S10","JC-S11","Per-6","OPN-6","TRT-4","NHN26","WLF","WLF-63","KOOTR1","SF5","CACG6","CACN9","DPRN104")
+inc4 = indNames(chrom11.4x.G)[!(indNames(chrom11.4x.G) %in% ninc)]
+chrom11.4x.Gb=new("genlight", (as.matrix(chrom11.4x.G)[inc4,])) # subset data
+chrom11.4x.Gb=new("genlight", (as.matrix(chrom11.4x.Gb)))
+chrom11.4x.Gb=new("genlight", (as.matrix(chrom11.4x.Gb))
+[,(colSums(is.na (as.matrix(chrom11.4x.Gb))) < nrow(chrom11.4x.Gb)*0.75)]) # retain only positions with no-missing data in > 25% individuals 
+pop(chrom11.4x.Gb)<-substr(indNames(chrom11.4x.Gb),1,3)
+pca.4 <- glPcaFast(chrom11.4x.Gb, nf=300) #Calculate PCAs
+colores=tipColors(indNames(chrom11.4x.Gb),stats) # get colors for tips
+g2 <- s.label (pca.4$scores, xax=1, yax=2, ppoints.col = colores, plabels = list(box = list(draw = FALSE),optim = TRUE), paxes.draw=T, pgrid.draw =F, plabels.cex=0.7, plot = TRUE) #PCA plot call
+```
